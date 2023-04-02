@@ -135,11 +135,11 @@ def _find_next(low, high):
     r = yield Compare()
 
     if low == high:
-        if r.value is True:
+        if r and r.value is True:
             return "clash" if r.raw_value.error else low
         return
 
-    if r.value is True:
+    if r and r.value is True:
         midpoint = (low + high) // 2
         res = yield from _find_next(low, midpoint)
         if res is not None:
@@ -179,7 +179,7 @@ def Commissioning(available_addresses=None, readdress=False,
         for a in range(0, 64):
             if a in available_addresses:
                 in_use = yield QueryControlGearPresent(Short(a))
-                if in_use.value:
+                if not in_use or in_use.value:
                     available_addresses.remove(a)
         yield progress(
             message=f"Available addresses: {available_addresses}")

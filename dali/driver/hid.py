@@ -694,6 +694,18 @@ class hasseb(hid):
     _OK = 2
     _INVALID_ANSWER = 3
 
+    sn = 0
+
+    HASSEB_DALI_FRAME               = 0X07
+
+    HASSEB_DRIVER_NO_DATA_AVAILABLE = 0
+    HASSEB_DRIVER_NO_ANSWER = 1
+    HASSEB_DRIVER_OK = 2
+    HASSEB_DRIVER_INVALID_ANSWER = 3
+    HASSEB_DRIVER_TOO_EARLY = 4
+    HASSEB_DRIVER_SNIFFER_BYTE = 5
+    HASSEB_DRIVER_SNIFFER_BYTE_ERROR = 6
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._log = self._log.getChild("hasseb")
@@ -701,15 +713,44 @@ class hasseb(hid):
         self._response_available = asyncio.Event()
         self._response = None
 
+    def construct(self, command):
+        # sequence number
+        self.sn = self.sn+1
+        if self.sn > 255:
+            self.sn = 1
+        frame_length = 16
+        if command.is_query:
+            expect_reply = 1
+        else:
+            expect_reply = 0
+        transmitter_settling_time = 0
+        if command.sendtwice:
+            send_twice = 10 # 10 ms delay between messages
+        else:
+            send_twice = 0
+        frame = command.frame.as_byte_sequence
+        byte_a, byte_b = frame
+        data = struct.pack('BBBBBBBBBB', 0xAA, self.HASSEB_DALI_FRAME, self.sn,
+                           frame_length, expect_reply,
+                           transmitter_settling_time, send_twice,
+                           byte_a, byte_b,
+                           0)
+        return data
+
     async def _send_raw(self, command):
         frame = command.frame
         if len(frame) != 16:
             raise UnsupportedFrameTypeError
         await self.connected.wait()
         async with self._command_lock:
-            times = 2 if command.sendtwice else 1
-            for rep in range(times):
-                os.write(self._f, frame.pack_len(2))
+            #times = 2 if command.sendtwice else 1
+            #for rep in range(times):
+            #    os.write(self._f, frame.pack_len(2))
+
+            data = self.construct(command)
+            self._log.debug("send: %r", data)
+            os.write(self._f, data)
+
             # Earlier commands may have left a response available that
             # we need to ignore.  We're only interested in responses
             # that become available in the future.
@@ -724,19 +765,26 @@ class hasseb(hid):
                 # NB there is NO WAY that this can be reliable: it
                 # won't understand commands from IEC-62386 part 202,
                 # for example.
-                await self._response_available.wait()
+                try:
+                    await asyncio.wait_for(self._response_available.wait(), timeout=1.0)
+                except Exception as e:
+                    self._log.exception("timeout", e)
+                    return None
                 self._response_available.clear()
-                if self._response == "fail":
-                    raise CommunicationError
-                elif self._response[0] == self._NO_ANSWER:
+                if self._response[0] == self.HASSEB_DRIVER_NO_ANSWER:
                     response = command.response(None)
-                elif self._response[0] == self._OK:
-                    response = command.response(dali.frame.BackwardFrame(self._response[1]))
-                elif self._response[0] == self._INVALID_ANSWER:
-                    response = command._response(dali.frame.BackwardFrameError(
-                        self._response[1]))
+                elif self._response[0] == self.HASSEB_DRIVER_OK and self._response[1] == 1:
+                    response = command.response(dali.frame.BackwardFrame(self._response[2]))
+                elif self._response[0] == self.HASSEB_DRIVER_INVALID_ANSWER:
+                    response = command._response(dali.frame.BackwardFrameError(self._response[255]))
+                elif self._response[0] == self.HASSEB_DRIVER_TOO_EARLY:
+                    self._log.debug("too early")
+                elif self._response[0] == self.HASSEB_DRIVER_SNIFFER_BYTE:
+                    self._log.debug("sniffer byte")
+                elif self._response[0] == self.HASSEB_DRIVER_SNIFFER_BYTE_ERROR:
+                    self._log.debug("sniffer byte error")
                 else:
-                    self._log.debug("Unknown response code %x", self._response[0])
+                    self._log.debug("Unknown response:", self._response)
 
             self.bus_traffic._invoke(command, response, False)
             return response
@@ -745,8 +793,10 @@ class hasseb(hid):
         # Response should be two bytes.  First byte is status, second
         # byte is optional response data.  The hasseb appears to send
         # "NO DATA AVAILABLE" reports continuously when it is idle.
-        if data[0] != self._NO_DATA_AVAILABLE:
-            self._response = data
+
+        if data[1] == self.HASSEB_DALI_FRAME:
+            print("dali frame:", repr(data))
+            self._response = data[3:]
             self._response_available.set()
 
     def _shutdown_device(self):
